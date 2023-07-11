@@ -66,7 +66,8 @@ def mask_CT(image_file, out_file, threshold_value=200):
     for z in range(0,BODY.shape[2]):    
         BODY[:,:,z] = ndi.binary_fill_holes(BODY[:,:,z])  
 
-    new_image = nb.Nifti1Image(BODY.astype(np.int8), image_nb.affine)
+    #new_image = nb.Nifti1Image(BODY.astype(np.int8), image_nb.affine)
+    new_image = nb.Nifti1Image(BODY.astype(np.int16), image_nb.affine)
     #out_file = os.path.join(output_dir, image)
     #out_file = os.path.join(output_dir, "seg.nii.gz")
     nb.save(new_image,out_file)

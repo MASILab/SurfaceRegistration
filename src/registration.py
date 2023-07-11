@@ -111,7 +111,7 @@ def calc_mse_points_to_mesh(point_mesh, surf_mesh):
 def get_vertices_vtk(f_path, outpath):
     # Load the VTK file
     reader = vtk.vtkPolyDataReader()
-    reader.SetFileName(f_path)
+    reader.SetFileName(str(f_path))
     reader.Update()
 
     # Get the output polydata
@@ -133,7 +133,7 @@ def align_vtk_to_origin(f_path, output):
 
     # Load the VTK file
     reader = vtk.vtkPolyDataReader()
-    reader.SetFileName(f_path)
+    reader.SetFileName(str(f_path))
     reader.Update()
 
     # Get the output polydata
@@ -158,7 +158,7 @@ def align_vtk_to_origin(f_path, output):
 
     # Save the aligned points to a VTK file
     writer = vtk.vtkPolyDataWriter()
-    writer.SetFileName(output)
+    writer.SetFileName(str(output))
     writer.SetInputData(polydata)
     writer.Write()
 
@@ -166,7 +166,7 @@ def align_vtk_to_origin(f_path, output):
 
 def get_principal_axes(vtk_file, plot=False):
     reader = vtk.vtkPolyDataReader()
-    reader.SetFileName(vtk_file)
+    reader.SetFileName(str(vtk_file))
     reader.Update()
 
     # Get the vertex positions from the VTK dataset
@@ -211,7 +211,7 @@ def get_principal_axes(vtk_file, plot=False):
 def get_points_vtk(vtk_file):
     # Load the VTK file
     reader = vtk.vtkPolyDataReader()
-    reader.SetFileName(vtk_file)
+    reader.SetFileName(str(vtk_file))
     reader.Update()
 
     # Get the polydata object from the reader
@@ -233,7 +233,7 @@ def get_points_vtk(vtk_file):
 def apply_rotation_vtk(vtk_file, rot, output):
     # Load the VTK file
     reader = vtk.vtkPolyDataReader()
-    reader.SetFileName(vtk_file)
+    reader.SetFileName(str(vtk_file))
     reader.Update()
 
     # Get the polydata object from the reader
@@ -260,7 +260,7 @@ def apply_rotation_vtk(vtk_file, rot, output):
 
     # Save the modified polydata to a VTK file
     writer = vtk.vtkPolyDataWriter()
-    writer.SetFileName(output)
+    writer.SetFileName(str(output))
     writer.SetInputData(polydata)
     writer.Write()
 
@@ -300,7 +300,7 @@ def output_new_vtk(polydata, newpoints, outfile):
     #output the new vtk file
         # Save the modified polydata to a VTK file
     writer = vtk.vtkPolyDataWriter()
-    writer.SetFileName(outfile)
+    writer.SetFileName(str(outfile))
     writer.SetInputData(polydata)
     writer.Write()
 
@@ -315,25 +315,37 @@ def output_new_vtk(polydata, newpoints, outfile):
 def register_vtk_to_nifti(nifti, obj, png, output_dir, threshold_value=200, inversions=[False, False, False]):
 
     #first, convert the obj file to vtk
-    vtk_from_obj = output_dir("moving_mesh.vtk")
+    print("***CONVERTING OBJ TO VTK***")
+    vtk_from_obj = output_dir/("moving_mesh.vtk")
     utils.create_vtk_from_obj(obj, png, vtk_from_obj)
+    print("***DONE CONVERTING OBJ TO VTK***")
 
     #also convert the CT nifti into a binary mask that we will use to create a surface
-    bodyFatSofttissueMask.mask_CT(nifti, output_dir, threshold_value=threshold_value)
+    print("***CONVERTING CT TO VTK***")
+    mask = output_dir/("mask.nii.gz")
+    bodyFatSofttissueMask.mask_CT(nifti, mask, threshold_value=threshold_value)
+        ###NOTE: nii2mesh cannot work on an 8bit int image or 64 float (look in source code to see which ones work)
+        ###Make sure that the mask coming out of the body tissue mask is 16 bit int
     static_vtk = output_dir/("static.vtk")
-    #nii2mesh_cmd = "nii2mesh -v 1 static.vtk"
-    subprocess.run(['nii2mesh', '-v', '1', '{}'.format(str(static_vtk))])
+    nii2mesh_cmd = "nii2mesh {} -v 1 {}".format(str(mask), str(static_vtk))
+    subprocess.run(nii2mesh_cmd, shell=True)
+    #subprocess.run(['nii2mesh', '{}', '-v', '1', '{}'.format(str(mask), str(static_vtk))])
+    print("***DONE CONVERTING CT TO VTK***")
 
     ## Next, align the input vtk meshes centroids to the origin
+    print("***ALIGNING MESHES TO ORIGIN***")
     static_vtk_centered = output_dir/("static_centered.vtk")
     moving_vtk_centered = output_dir/("moving_centered.vtk")
     align_vtk_to_origin(static_vtk, static_vtk_centered)
     align_vtk_to_origin(vtk_from_obj, moving_vtk_centered)
+    print("***DONE ALIGNING MESHES TO ORIGIN***")
     #align_vtk_to_origin('/home-local/kimm58/SPIE2023/mask_out/output_mesh.vtk', '/home-local/kimm58/SPIE2023/mask_out/output_mesh_centered.vtk')
     #align_vtk_to_origin('/home-local/kimm58/SPIE2023/data/H1Capture/hip_on_bottle.vtk', '/home-local/kimm58/SPIE2023/data/H1Capture/hip_on_bottle_centered.vtk')
 
+
     ## Then, do a preliminary alignment based on PCA (specify which axes to invert for PCA)
     #get the principal axes and pointclouds
+    print("***BEGINNING PCA ALIGNMENT***")
     svertices, sfaces, sprincipal_axes, seigenvalues = get_principal_axes(static_vtk_centered, plot=False)
     mvertices, mfaces, mprincipal_axes, meigenvalues = get_principal_axes(moving_vtk_centered, plot=False)
 
@@ -345,20 +357,39 @@ def register_vtk_to_nifti(nifti, obj, png, output_dir, threshold_value=200, inve
 
     #calculate the rotation from PCA
     rot = np.dot(sprincipal_axes.T, mprincipal_axes)
+    pca_rot = output_dir/("PCA_rotation.npy")
+    print("***CALCULATED PCA REGISTRATION. SAVING REGISTRATION TO {}***".format(str(pca_rot)))
+    np.savetxt(pca_rot, rot)
 
     #apply the rotation to the moving vtk file and save it
+    print("***APPLYING PCA ALIGNMENT***")
     pca_aligned = output_dir/("moving_PCA_aligned.vtk")
     apply_rotation_vtk(moving_vtk_centered, rot, pca_aligned)
+    print("***DONE APPLYING PCA ALIGNMENT***")
 
     #now that they are principally aligned, use ICP to do a better alignment
+    print("***COMPUTING ICP ALIGNMENT***")
     ICP_sol, mpolydata = icp_registration(static_vtk_centered, pca_aligned)
 
-    #get the registered points
+    #get the registered points and transforms
     moved_points = ICP_sol.Xt.squeeze(0).numpy()
+    icp_r = ICP_sol.RTs.R.squeeze(0).numpy()
+    icp_t = ICP_sol.RTs.T.squeeze(0).numpy()
+    icp_s = ICP_sol.RTs.s.numpy()
+
 
     #output the registered surface to a new vtk file
+    print("***DONE COMPUTING ICP ALIGNMENT. SAVING REGISTERED VTK FILE AND TRANSFORMS***")
+        #save new vtk file
     ICP_aligned_vtk = output_dir/("moving_ICP_aligned.vtk")
-    output_new_vtk(mpolydata, moved_points)
+    output_new_vtk(mpolydata, moved_points, ICP_aligned_vtk)
+        #save icp transofrms
+    icp_r_f = output_dir/("ICP_rotation.npy")
+    icp_r_t = output_dir/("ICP_translation.npy")
+    icp_r_s = output_dir/("ICP_scale.npy")
+    np.savetxt(icp_r_f, icp_r)
+    np.savetxt(icp_r_t, icp_t)
+    np.savetxt(icp_r_s, icp_s)
 
 
 

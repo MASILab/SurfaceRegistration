@@ -160,7 +160,7 @@ def convert_stl_to_vtk(stl_file_path, outpath):
 
     # Read the STL file
     reader = vtk.vtkSTLReader()
-    reader.SetFileName(stl_file_path)
+    reader.SetFileName(str(stl_file_path))
     reader.Update()
 
     # Get the polydata from the reader
@@ -199,6 +199,6 @@ def scale_up_vertices_obj(input, output):
 
     # Optionally, you can write the modified polydata to a new PLY file
     writer = vtk.vtkOBJWriter()
-    writer.SetFileName(output)
+    writer.SetFileName(str(output))
     writer.SetInputData(polydata)
     writer.Write()
