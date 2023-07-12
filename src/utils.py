@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import vtk
 from tqdm import tqdm
+import trimesh
 
 ###
 ### Convert OBJ and PNG to VTK
@@ -199,6 +200,266 @@ def scale_up_vertices_obj(input, output):
 
     # Optionally, you can write the modified polydata to a new PLY file
     writer = vtk.vtkOBJWriter()
+    writer.SetFileName(str(output))
+    writer.SetInputData(polydata)
+    writer.Write()
+
+
+#remove colors from the vertices
+    #if green is higher than 200
+#def remove_colors_from_mesh(mesh, output):
+    face_colors = mesh.visual.face_colors[:, :3]
+    color_threshold = [0,200,0]
+    faces_to_keep = np.any(face_colors <= color_threshold, axis=1)
+
+    selectedv = mesh.vertices
+    selectedf = mesh.faces[faces_to_keep]
+
+    # Create a new mesh with the selected vertices and faces
+    new_mesh = trimesh.Trimesh(vertices=selectedv, faces=selectedf)
+
+    # Remove isolated vertices
+    new_mesh.remove_unreferenced_vertices()
+
+    new_mesh.export(output, file_type='ply')
+
+def position_threshold_mesh(input, output, min=[-0.4, -0.4, -0.4], max=[0.4, 0.4, 0.4]):
+    #remove all vertices that do not fall within the box defined by min and max
+
+    def is_outside_bounds(vertex):
+        return 
+
+    # Read the VTK file
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(str(input))
+    reader.Update()
+
+    # Get the polydata from the reader
+    polydata = reader.GetOutput()
+
+    # Get the point data and RGB color array
+    point_data = polydata.GetPointData()
+    color_array = point_data.GetArray("Colors")
+
+    # Create a mask for the vertices to remove
+    mask = np.ones(polydata.GetNumberOfPoints(), dtype=bool)
+
+    # Iterate over the points
+    for i in range(polydata.GetNumberOfPoints()):
+        
+        vertex = np.array(polydata.GetPoint(i))
+        if np.any(vertex < min) or np.any(vertex > max):
+            mask[i] = False #mark vertex for removal
+
+        # exit(0)
+        # ####
+        # if vertex:
+        #     mask[i] = False  # Mark the vertex for removal
+
+    print("Done creating mask. Now using mask to filter out vertices...")
+    # Create a new polydata to hold the filtered data
+    filtered_polydata = vtk.vtkPolyData()
+
+    # Copy the remaining points to the filtered polydata
+    points = vtk.vtkPoints()
+    filtered_colors = vtk.vtkUnsignedCharArray()
+    filtered_colors.SetNumberOfComponents(3)
+    filtered_colors.SetName("Colors")
+
+    # Create a map from old vertex IDs to new vertex IDs
+    vertex_map = {}
+
+    print("Total points:", polydata.GetNumberOfPoints())
+    print("Number of points to keep:", np.count_nonzero(mask))
+
+    for i in range(polydata.GetNumberOfPoints()):
+        if mask[i]:
+            new_vertex_id = points.InsertNextPoint(polydata.GetPoint(i))
+            #points.InsertNextPoint(polydata.GetPoint(i))
+            vertex_map[i] = new_vertex_id
+            color_tuple = color_array.GetTuple(i)
+            #print(i)
+            #print(polydata.GetPoint(i))
+            #print(color_tuple)
+            filtered_colors.InsertNextTuple3(color_tuple[0], color_tuple[1], color_tuple[2])
+            #print(filtered_colors.GetTuple(filtered_colors.GetNumberOfTuples() - 1))
+            #exit(0)
+            #vtk_colors.InsertNextTuple3(int(color[0]), int(color[1]), int(color[2]))
+
+    filtered_polydata.SetPoints(points)
+    filtered_polydata.GetPointData().SetScalars(filtered_colors)
+
+    print("Now removing faces associated with removed vertices...")
+
+    # Remove the faces associated with the removed vertices
+    filtered_faces = vtk.vtkCellArray()
+    faces = polydata.GetPolys()
+    faces.InitTraversal()
+
+    while True:
+        face = vtk.vtkIdList()
+        if faces.GetNextCell(face) == 0:
+            break
+        # Check if all face vertices are in the vertex map
+        if all(vertex_map.get(face.GetId(j)) is not None for j in range(3)):
+            filtered_face = vtk.vtkIdList()
+            for j in range(3):
+                vertex_id = vertex_map[face.GetId(j)]
+                filtered_face.InsertNextId(vertex_id)
+            filtered_faces.InsertNextCell(filtered_face)
+
+    print("Done filtering faces. Now exporting vtk file...")
+
+    filtered_polydata.SetPolys(filtered_faces)
+
+    # Write the filtered polydata to a new VTK file
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetFileName(str(output))
+    writer.SetInputData(filtered_polydata)
+    writer.Write()
+
+#thresholds a mesh based on color
+    #tailered to green
+def color_threshold_mesh(input, output, abs_threshold=[200,200,200], ratio_threshold=0.75, g_abs_thresh=90):
+
+    def pass_abs_threshold(color, R, G, B):
+        return color[0] < R and color[1] > G and color[2] < B
+    
+    def pass_ratio_threshold(color):
+        red, green, blue = color[0], color[1], color[2]
+        if green == 0:
+            return False
+        return red/green < ratio_threshold and blue/green < ratio_threshold and green > g_abs_thresh
+
+    # Read the VTK file
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(str(input))
+    reader.Update()
+
+    # Get the polydata from the reader
+    polydata = reader.GetOutput()
+
+    # Get the point data and RGB color array
+    point_data = polydata.GetPointData()
+    color_array = point_data.GetArray("Colors")
+
+    # Create a mask for the vertices to remove
+    mask = np.ones(polydata.GetNumberOfPoints(), dtype=bool)
+
+    # Iterate over the points and colors
+    R = abs_threshold[0]
+    G = abs_threshold[1]
+    B = abs_threshold[2]
+    print("Creating mask based on color threshold of [{},{},{}]...".format(R, G, B))
+    for i in range(polydata.GetNumberOfPoints()):
+        color = color_array.GetTuple(i)
+
+        if pass_abs_threshold(color, R, G, B) or pass_ratio_threshold(color):
+            mask[i] = False  # Mark the vertex for removal
+
+    print("Done creating mask. Now using mask to filter out vertices...")
+    # Create a new polydata to hold the filtered data
+    filtered_polydata = vtk.vtkPolyData()
+
+    # Copy the remaining points to the filtered polydata
+    points = vtk.vtkPoints()
+    filtered_colors = vtk.vtkUnsignedCharArray()
+    filtered_colors.SetNumberOfComponents(3)
+    filtered_colors.SetName("Colors")
+
+    # Create a map from old vertex IDs to new vertex IDs
+    vertex_map = {}
+
+    print("Total points:", polydata.GetNumberOfPoints())
+    print("Number of points to keep:", np.count_nonzero(mask))
+
+    for i in range(polydata.GetNumberOfPoints()):
+        if mask[i]:
+            new_vertex_id = points.InsertNextPoint(polydata.GetPoint(i))
+            #points.InsertNextPoint(polydata.GetPoint(i))
+            vertex_map[i] = new_vertex_id
+            color_tuple = color_array.GetTuple(i)
+            #print(i)
+            #print(polydata.GetPoint(i))
+            #print(color_tuple)
+            filtered_colors.InsertNextTuple3(color_tuple[0], color_tuple[1], color_tuple[2])
+            #print(filtered_colors.GetTuple(filtered_colors.GetNumberOfTuples() - 1))
+            #exit(0)
+            #vtk_colors.InsertNextTuple3(int(color[0]), int(color[1]), int(color[2]))
+
+    filtered_polydata.SetPoints(points)
+    filtered_polydata.GetPointData().SetScalars(filtered_colors)
+
+    print("Now removing faces associated with removed vertices...")
+
+    # Remove the faces associated with the removed vertices
+    filtered_faces = vtk.vtkCellArray()
+    faces = polydata.GetPolys()
+    faces.InitTraversal()
+
+    while True:
+        face = vtk.vtkIdList()
+        if faces.GetNextCell(face) == 0:
+            break
+        # Check if all face vertices are in the vertex map
+        if all(vertex_map.get(face.GetId(j)) is not None for j in range(3)):
+            filtered_face = vtk.vtkIdList()
+            for j in range(3):
+                vertex_id = vertex_map[face.GetId(j)]
+                filtered_face.InsertNextId(vertex_id)
+            filtered_faces.InsertNextCell(filtered_face)
+
+    print("Done filtering faces. Now exporting vtk file...")
+
+    filtered_polydata.SetPolys(filtered_faces)
+
+    # Write the filtered polydata to a new VTK file
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetFileName(str(output))
+    writer.SetInputData(filtered_polydata)
+    writer.Write()
+
+#convert ply to vtk
+    #for NeRF output
+def convert_ply_to_vtk(input, output):
+    # Load the PLY file using trimesh
+    mesh = trimesh.load_mesh(str(input))
+
+    # Extract the vertices and faces from the mesh
+    vertices = mesh.vertices
+    faces = mesh.faces.reshape(-1, 3)
+
+    # Create a VTK PolyData object
+    polydata = vtk.vtkPolyData()
+
+    # Create a vtkPoints object and set the vertex coordinates
+    vtk_points = vtk.vtkPoints()
+    vtk_points.SetData(numpy_to_vtk(vertices))
+    polydata.SetPoints(vtk_points)
+
+    # Create a vtkCellArray to store the faces
+    vtk_faces = vtk.vtkCellArray()
+
+    # Add the faces to the vtkCellArray
+    for face in faces:
+        vtk_faces.InsertNextCell(3, [int(face[0]), int(face[1]), int(face[2])])
+
+    polydata.SetPolys(vtk_faces)
+
+    # Add color to the vertices
+    colors = mesh.visual.vertex_colors  # Assuming color data exists in the PLY file
+
+    vtk_colors = vtk.vtkUnsignedCharArray()
+    vtk_colors.SetName("Colors")
+    vtk_colors.SetNumberOfComponents(3)
+
+    for color in colors:
+        vtk_colors.InsertNextTuple3(int(color[0]), int(color[1]), int(color[2]))
+
+    polydata.GetPointData().SetScalars(vtk_colors)
+
+    # Write the PolyData to a VTK file
+    writer = vtk.vtkPolyDataWriter()
     writer.SetFileName(str(output))
     writer.SetInputData(polydata)
     writer.Write()

@@ -7,6 +7,7 @@ import vtk
 import trimesh
 import numpy as np
 import subprocess
+import pandas as pd
 
 import utils
 import bodyFatSofttissueMask
@@ -228,7 +229,16 @@ def get_points_vtk(vtk_file):
         point = points.GetPoint(i)
         point_list.append(point)
 
-    return polydata, point_list, num_points
+    faces = []
+    for i in range(polydata.GetNumberOfCells()):
+        cell = polydata.GetCell(i)
+        face = []
+        for j in range(cell.GetNumberOfPoints()):
+            point_id = cell.GetPointId(j)
+            face.append(point_id)
+        faces.append(face)
+
+    return polydata, point_list, num_points, faces
 
 def apply_rotation_vtk(vtk_file, rot, output):
     # Load the VTK file
@@ -266,8 +276,8 @@ def apply_rotation_vtk(vtk_file, rot, output):
 
 def icp_registration(static_vtk, moving_vtk):
     
-    spolydata, spoints, snum_points = get_points_vtk(static_vtk)
-    mpolydata, mpoints, mnum_points = get_points_vtk(moving_vtk)
+    spolydata, spoints, snum_points, sfaces = get_points_vtk(static_vtk)
+    mpolydata, mpoints, mnum_points, mfaces = get_points_vtk(moving_vtk)
 
     mtensor = torch.tensor(mpoints).unsqueeze(0)
     mtensor.to('cpu')
@@ -304,9 +314,83 @@ def output_new_vtk(polydata, newpoints, outfile):
     writer.SetInputData(polydata)
     writer.Write()
 
+#reads a csv to get the fiducials
+    #assumes that the points were selected via paraview and exported as a csv
+def get_fiducials_from_csv(path):
+
+    df = pd.read_csv(path)
+
+    points = []
+    for row in df.iterrows():
+        
+        x = row[1]['Points_0']
+        y = row[1]['Points_1']
+        z = row[1]['Points_2']
+        points.append(np.array([x,y,z]))
+
+    return np.stack(points)
+
+#applies the transforms to the fiducials
+def apply_transforms_to_fiducials(PCA_r, ICP_r, ICP_t, points, debug=False):
+    #points is an Nx3 numpy array
+
+    #rot1
+    if debug:
+        print("Original Centered")
+        print(points)
+    #x = np.dot(points, PCA_r)
+    x = np.dot(points, PCA_r.T)
+    if debug:
+        print("PCA aligned")
+        print(x)
+    x = np.dot(x, ICP_r)
+    if debug:
+        print("ICP rotation")
+        print(x)
+    x = x + ICP_t
+    if debug:
+        print("ICP translation")
+        print(x)
+
+    return x
+
+#get the transforms
+def get_transforms(rootpath):
+
+    #gets the transforms for PCA and ICP
+    outputs = rootpath/("outputs")
+    pca_r = np.loadtxt(outputs/("PCA_rotation.npy"))
+    icp_r = np.loadtxt(outputs/("ICP_rotation.npy"))
+    icp_t = np.loadtxt(outputs/("ICP_translation.npy"))
+
+    return (pca_r, icp_r, icp_t)
 
 
+def create_vtk_pointcloud(array, output):
+    #given a numpy array of size Nx3, outputs a pointcloud
+    polydata = vtk.vtkPolyData()
 
+    vtk_points = vtk.vtkPoints()
+    for point in array:
+        vtk_points.InsertNextPoint(point)
+    polydata.SetPoints(vtk_points)
+
+    # Create a vtkVertexGlyphFilter to convert points to vertices
+    vertex_filter = vtk.vtkVertexGlyphFilter()
+    vertex_filter.SetInputData(polydata)
+    vertex_filter.Update()
+
+    point_cloud_polydata = vertex_filter.GetOutput()
+
+    # Save the point cloud as a VTK file
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetFileName(str(output))
+    writer.SetInputData(point_cloud_polydata)
+    writer.Write()
+
+#def plot_fiducials(static, moving):
+
+    #given two sets of points, plots the fiducials
 
 ###########################
 ## Main function ##########
