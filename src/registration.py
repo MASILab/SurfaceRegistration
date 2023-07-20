@@ -8,6 +8,7 @@ import trimesh
 import numpy as np
 import subprocess
 import pandas as pd
+from tqdm import tqdm
 
 import utils
 import bodyFatSofttissueMask
@@ -72,6 +73,17 @@ def calc_mse_points_to_mesh(point_mesh, surf_mesh):
     #now square them
     return np.array(distances)**2
 
+def calc_fiducial_mse(v1, v2):
+    #given two sets of vertices, calculate the MSE distance between them
+    #assumes that they are ordered
+        #otherwise, finds the closest pairs?
+    
+    dist_sum = 0
+    for i in range(v1.shape[0]):
+        dist_sum += np.linalg.norm(v1[i], v2[i])
+    
+    print("Dist sum:", dist_sum)
+    return dist_sum
 
 ####
 # def plot_mesh_and_pricipal_axes(vertices, centroid, eigenvalues, principal_axes):
@@ -274,7 +286,7 @@ def apply_rotation_vtk(vtk_file, rot, output):
     writer.SetInputData(polydata)
     writer.Write()
 
-def icp_registration(static_vtk, moving_vtk):
+def icp_registration(static_vtk, moving_vtk, estimate_scale=False):
     
     spolydata, spoints, snum_points, sfaces = get_points_vtk(static_vtk)
     mpolydata, mpoints, mnum_points, mfaces = get_points_vtk(moving_vtk)
@@ -283,7 +295,7 @@ def icp_registration(static_vtk, moving_vtk):
     mtensor.to('cpu')
     stensor = torch.tensor(spoints).unsqueeze(0)
     stensor.to('cpu')
-    ICP_sol = iterative_closest_point(mtensor, stensor)
+    ICP_sol = iterative_closest_point(mtensor, stensor, estimate_scale=estimate_scale)
 
     return ICP_sol, mpolydata
 
@@ -366,6 +378,69 @@ def get_transforms(rootpath):
     return (pca_r, icp_r, icp_t)
 
 
+
+#scale up the surface to the proper dimensions
+def scale_up_mesh(static, moving, output):
+
+    def get_furthest_distance(points):
+        longest = 0
+        pair = ()
+        numpoints = points.GetNumberOfPoints()
+        for i in tqdm(range(numpoints)):
+            point1 = points.GetPoint(i)
+            for j in range(i+1, numpoints):
+                point2 = points.GetPoint(j)
+                dist = vtk.vtkMath.Distance2BetweenPoints(point1, point2)
+
+                if dist > longest:
+                    longest = dist
+                    pair = (point1, point2)
+    
+        return pair, longest
+
+    #read in the polydatas    
+    static_reader = vtk.vtkPolyDataReader()
+    moving_reader = vtk.vtkPolyDataReader()
+    static_reader.SetFileName(str(static))
+    moving_reader.SetFileName(str(moving))
+    static_reader.Update()
+    moving_reader.Update()
+
+    #get the furthest distance between any two points for the static data
+    print("Calculating the furthest distance between any two points on the static mesh...")
+    static_pair, static_dist = utils.appx_max_distance_mesh(static_reader.GetOutput().GetPoints()) #get_furthest_distance(static_reader.GetOutput().GetPoints())
+
+    #do the same for the moving mesh
+    moving_poly = moving_reader.GetOutput()
+    moving_points = moving_poly.GetPoints()
+    print("Calculating the furthest distance between any two points on the moving mesh...")
+    moving_pair, moving_dist = utils.appx_max_distance_mesh(moving_points)
+
+    #now, find the scaling factor and use it to scale up the points
+    scale = static_dist / moving_dist
+    print(scale)
+    print(static_dist)
+    print(moving_dist)
+    print("static pair:",static_pair)
+    print("moving pair:",moving_pair)
+
+    #apply the transform to the moving mesh
+    print("Applying the scaling to the moving mesh...")
+    for i in tqdm(range(moving_points.GetNumberOfPoints())):
+        point = moving_points.GetPoint(i)
+        expanded_point = [coord * scale for coord in point]
+        moving_points.SetPoint(i, expanded_point)
+
+
+    #now save the output of the scaled mesh
+    print("Now saving the scaled mesh...")
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetFileName(str(output))
+    writer.SetInputData(moving_poly)
+    writer.Write()
+
+    return scale
+
 def create_vtk_pointcloud(array, output):
     #given a numpy array of size Nx3, outputs a pointcloud
     polydata = vtk.vtkPolyData()
@@ -388,7 +463,46 @@ def create_vtk_pointcloud(array, output):
     writer.SetInputData(point_cloud_polydata)
     writer.Write()
 
-#def plot_fiducials(static, moving):
+#performs a reverse ICP registration, then inverts the transform and applies it to the NeRF data
+    #helps remove registration error due to noise points in the NeRF
+def reverse_icp_registration(CT, nerf, output, R=None, t=None, s=None):
+    #given the transforms and the scale, reverse the ICP transform so that the nerf surface moves to the CT
+    #read in the polydatas
+    ct_poly = utils.get_polydata_vtk(CT)
+    nerf_poly = utils.get_polydata_vtk(nerf)
+
+    if R == None and s == None and t == None:
+        print("Performing ICP registration from CT to NeRF surface...")
+        ICP_sol, moved_polydata = icp_registration(nerf, CT, estimate_scale=True)
+        R = ICP_sol.RTs.R
+        t = ICP_sol.RTs.T
+        s = ICP_sol.RTs.s
+
+
+    nerf_points = nerf_poly.GetPoints()
+
+    #get the inverse transforms
+    rinv = np.linalg.inv(R.squeeze(0).numpy())
+    tinv = -t.numpy()
+    sinv = 1/s.numpy()
+
+    #apply the inverse rotation, translation, and scaling
+    print("Applying reverse registration and scaling to the points...")
+    for i in tqdm(range(nerf_points.GetNumberOfPoints())):
+        point = nerf_points.GetPoint(i)
+        shifted_point = point + tinv
+        rotated_point = np.dot(shifted_point, rinv)
+        expanded_point = [coord * sinv for coord in rotated_point]
+        nerf_points.SetPoint(i, expanded_point[0])
+
+    #save the output
+    print("***DONE COMPUTING ICP ALIGNMENT. SAVING REGISTERED VTK FILE***")
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetFileName(str(output))
+    writer.SetInputData(nerf_poly)
+    writer.Write()
+
+    return rinv, tinv, sinv
 
     #given two sets of points, plots the fiducials
 
@@ -396,13 +510,17 @@ def create_vtk_pointcloud(array, output):
 ## Main function ##########
 ###########################
 
-def register_vtk_to_nifti(nifti, obj, png, output_dir, threshold_value=200, inversions=[False, False, False]):
+def register_vtk_to_nifti(nifti, src, png, output_dir, threshold_value=200, inversions=[False, False, False]):
 
     #first, convert the obj file to vtk
-    print("***CONVERTING OBJ TO VTK***")
-    vtk_from_obj = output_dir/("moving_mesh.vtk")
-    utils.create_vtk_from_obj(obj, png, vtk_from_obj)
-    print("***DONE CONVERTING OBJ TO VTK***")
+
+    if str(src).endswith('.obj'):
+        print("***CONVERTING OBJ TO VTK***")
+        vtk_from_obj = output_dir/("moving_mesh.vtk")
+        utils.create_vtk_from_obj(src, png, vtk_from_obj)
+        print("***DONE CONVERTING OBJ TO VTK***")
+    elif str(src).endswith('.vtk'):
+        vtk_from_obj = src
 
     #also convert the CT nifti into a binary mask that we will use to create a surface
     print("***CONVERTING CT TO VTK***")
@@ -418,6 +536,7 @@ def register_vtk_to_nifti(nifti, obj, png, output_dir, threshold_value=200, inve
 
     ## Next, align the input vtk meshes centroids to the origin
     print("***ALIGNING MESHES TO ORIGIN***")
+    print("{} and {}".format(str(static_vtk), str(vtk_from_obj)))
     static_vtk_centered = output_dir/("static_centered.vtk")
     moving_vtk_centered = output_dir/("moving_centered.vtk")
     align_vtk_to_origin(static_vtk, static_vtk_centered)
@@ -453,21 +572,39 @@ def register_vtk_to_nifti(nifti, obj, png, output_dir, threshold_value=200, inve
 
     #now that they are principally aligned, use ICP to do a better alignment
     print("***COMPUTING ICP ALIGNMENT***")
-    ICP_sol, mpolydata = icp_registration(static_vtk_centered, pca_aligned)
-
-    #get the registered points and transforms
-    moved_points = ICP_sol.Xt.squeeze(0).numpy()
-    icp_r = ICP_sol.RTs.R.squeeze(0).numpy()
-    icp_t = ICP_sol.RTs.T.squeeze(0).numpy()
-    icp_s = ICP_sol.RTs.s.numpy()
-
-
-    #output the registered surface to a new vtk file
-    print("***DONE COMPUTING ICP ALIGNMENT. SAVING REGISTERED VTK FILE AND TRANSFORMS***")
-        #save new vtk file
     ICP_aligned_vtk = output_dir/("moving_ICP_aligned.vtk")
-    output_new_vtk(mpolydata, moved_points, ICP_aligned_vtk)
-        #save icp transofrms
+    if str(src).endswith('.obj'):
+        ICP_sol, mpolydata = icp_registration(static_vtk_centered, pca_aligned)
+        #get the registered points and transforms
+        moved_points = ICP_sol.Xt.squeeze(0).numpy()
+        icp_r = ICP_sol.RTs.R.squeeze(0).numpy()
+        icp_t = ICP_sol.RTs.T.squeeze(0).numpy()
+        icp_s = ICP_sol.RTs.s.numpy()
+            #output the registered surface to a new vtk file
+        print("***DONE COMPUTING ICP ALIGNMENT. SAVING REGISTERED VTK FILE***")
+            #save new vtk file
+        output_new_vtk(mpolydata, moved_points, ICP_aligned_vtk)
+    #for NeRF registration
+        #need to do a preliminary scaling to make the NeRF surface roughly the same size as the CT
+        #need to do a reverse ICP, then apply the inverted transforms
+        #saves the inverted transforms (from NeRF to CT)
+    else:
+        #preliminary scaling
+        print("Data from NeRF, not H1 Camera. Using scale for ICP registration...")
+        print("Scaling the NeRF surface to be approximately the same size as the CT surface...")
+        moving_scaled = output_dir/("moving_scaled.vtk")
+        prelim_scale = scale_up_mesh(static_vtk_centered, pca_aligned, moving_scaled)
+        print("Done with preliminary scaling. Saving the preliminary scale factor...")
+        prelim_scale_f = output_dir/("prelim_scale.npy")
+        np.savetxt(prelim_scale_f, np.array([prelim_scale]))
+
+        print("Now registering CT to scaled NeRF via ICP. Using inverse transforms to move NeRF to CT space...")
+        #ICP_sol, mpolydata = icp_registration(static_vtk_centered, pca_aligned, estimate_scale=True)
+        icp_r, icp_t, icp_s = reverse_icp_registration(static_vtk_centered, moving_scaled, ICP_aligned_vtk, R=None, t=None, s=None)
+
+
+    #save icp transofrms
+    print("***SAVING TRANSFORMS***")
     icp_r_f = output_dir/("ICP_rotation.npy")
     icp_r_t = output_dir/("ICP_translation.npy")
     icp_r_s = output_dir/("ICP_scale.npy")

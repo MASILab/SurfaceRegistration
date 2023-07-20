@@ -5,6 +5,10 @@ import matplotlib.pyplot as plt
 import vtk
 from tqdm import tqdm
 import trimesh
+from vtk.util.numpy_support import numpy_to_vtk
+
+
+import registration
 
 ###
 ### Convert OBJ and PNG to VTK
@@ -173,7 +177,9 @@ def convert_stl_to_vtk(stl_file_path, outpath):
     writer.SetInputData(polydata)
     writer.Write()
 
-
+###
+### NeRF Pipeline
+###
 #scales up the vertices
 def scale_up_vertices_obj(input, output):
     # Create the PLY reader
@@ -419,6 +425,60 @@ def color_threshold_mesh(input, output, abs_threshold=[200,200,200], ratio_thres
     writer.SetInputData(filtered_polydata)
     writer.Write()
 
+
+def get_largest_connected_component(input, output):
+
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(str(input))
+    reader.Update()
+
+    connectivity_filter = vtk.vtkConnectivityFilter()
+    connectivity_filter.SetInputData(reader.GetOutput())
+    connectivity_filter.SetExtractionModeToLargestRegion()
+    connectivity_filter.Update()
+
+    outvtk = connectivity_filter.GetOutput()
+
+    print(connectivity_filter.GetNumberOfExtractedRegions())
+
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetFileName(str(output))
+    writer.SetInputData(outvtk)
+    writer.Write()
+
+def get_largest_component_near_origin(input, output, radius=1.0):
+    # Read the VTK file
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(str(input))
+    reader.Update()
+
+    # Create a sphere centered at the origin
+    sphere = vtk.vtkSphere()
+    sphere.SetCenter(0, 0, 0)
+    sphere.SetRadius(radius)  # Set the radius of the ball
+
+    # Apply vtkIntersectionPolyDataFilter to extract the intersection with the sphere
+    intersection_filter = vtk.vtkIntersectionPolyDataFilter()
+    intersection_filter.SetInputData(0, reader.GetOutput())
+    intersection_filter.SetGeometry(1, sphere)
+    intersection_filter.Update()
+
+    # Apply the vtkConnectivityFilter to extract the largest connected component
+    connectivity_filter = vtk.vtkConnectivityFilter()
+    connectivity_filter.SetInputConnection(intersection_filter.GetOutputPort())
+    connectivity_filter.SetExtractionModeToLargestRegion()
+    connectivity_filter.ColorRegionsOn()  # Optional: Color regions for visualization
+    connectivity_filter.Update()
+
+    # Get the output of the connectivity filter
+    outvtk = connectivity_filter.GetOutput()
+
+    # Write the output to a new VTK file
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetFileName(str(output))
+    writer.SetInputData(outvtk)
+    writer.Write()
+
 #convert ply to vtk
     #for NeRF output
 def convert_ply_to_vtk(input, output):
@@ -463,3 +523,142 @@ def convert_ply_to_vtk(input, output):
     writer.SetFileName(str(output))
     writer.SetInputData(polydata)
     writer.Write()
+
+
+def calc_fiducial_distances_hip_H1(rootdir):
+
+    def sort_by_proximity(v1, v2):
+        #match the fiducials
+        v2_match_list = []
+        dists = []
+        for i in range(v1.shape[0]):
+            mindist = 1000000
+            match = (0,0,0)
+            
+            for j in range(v2.shape[0]):
+                dist = np.linalg.norm(v1[i]-v2[j])
+                if dist < mindist:
+                    match = v2[j]
+                    mindist = dist
+            v2_match_list.append(match)
+            dists.append(mindist)
+        return np.stack(v2_match_list), dists
+
+    static = rootdir/("CT_centered_fiducials.vtk")
+    _, static_fiducials, _, _ = registration.get_points_vtk(static)
+
+    all_dists = []
+
+    for i in range(1, 6, 1):
+        surf_fiducials_file = rootdir/("hip{}".format(i))/("registered_fiducials.vtk")
+        _, surf_fiducials, _, _ = registration.get_points_vtk(surf_fiducials_file)
+        #print(surf_fiducials)
+        matched_fiducials, dists = sort_by_proximity(np.stack(static_fiducials), np.stack(surf_fiducials))
+
+        all_dists.append(dists)
+    return all_dists
+
+def get_component_with_point(input, output, coords=None, point_id=None):
+
+    # Read the VTK file
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(str(input))
+    reader.Update()
+
+    #get the coordinates of the point with the point ID
+    if coords:
+        point_coords = coords
+    elif point_id:
+        point_coords = reader.GetOutput().GetPoint(point_id)
+    else:
+        print("Error: Need either coordinates or point ID as input")
+        return None
+
+    #Extr
+    connectivity_filter = vtk.vtkPolyDataConnectivityFilter()
+    connectivity_filter.SetInputData(reader.GetOutput())
+    connectivity_filter.SetExtractionModeToClosestPointRegion()
+    connectivity_filter.SetClosestPoint(point_coords)
+    connectivity_filter.Update()
+
+    comp = connectivity_filter.GetOutput()
+
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetFileName(str(output))
+    writer.SetInputData(comp)
+    writer.Write()
+
+
+#approximation for the scaling
+    #fisrt, find the point that is furthest from the centroid
+    #then, find the point that is furthest from this point
+def appx_max_distance_mesh(points):
+
+    def calc_centroid_vtk(points):
+        x, y, z = 0, 0, 0
+        num_points = points.GetNumberOfPoints()
+        for i in range(num_points):
+            point = points.GetPoint(i)
+            x += point[0]
+            y += point[1]
+            z += point[2]
+        x /= num_points
+        y /= num_points
+        z /= num_points
+        return (x, y, z)
+
+    centroid = calc_centroid_vtk(points)
+    print(centroid)
+    #centroid = np.mean(points, axis=0)
+    num_points = points.GetNumberOfPoints()
+    longest1 = 0
+    point1 = None
+    
+    #First find the point that is furthest from the centroid
+    for i in range(num_points):
+        point = point1 = points.GetPoint(i)
+        dist = vtk.vtkMath.Distance2BetweenPoints(point, centroid)
+        if dist > longest1:
+            longest1 = dist
+            point1 = point
+    
+    #now, find the point that is furthest from this point
+    longest2 = 0
+    point2 = None
+    for i in range(num_points):
+        point = points.GetPoint(i)
+        dist = vtk.vtkMath.Distance2BetweenPoints(point1, point)
+        if dist > longest2:
+            longest2 = dist
+            point2 = point
+    
+    return (point1, point2), np.sqrt(longest2)
+
+
+#read in vtk file and return the polydata
+def get_polydata_vtk(input):
+    # Read the VTK file
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(str(input))
+    reader.Update()
+    return reader.GetOutput()
+
+#functions for calculating the maximum distance between two points on a mesh
+    #uses the convex hull method and Graham Scan
+# def rotating_calipers(points):
+
+#     def cross_product(a, b, c):
+#         #given 3 points, calculate the cross product between the 2 vectors they form
+#         v1 = b - a
+#         v2 = c - b
+#         return 
+
+
+#     def convex_hull(points):
+#         #assumes that the points are in a list?
+#         points.sort(key=lambda p: (p[0], p[1], p[2]))
+#         hull = []
+        
+#         for i in range(len(points)):
+
+#             while len(hull) >= 2 and cross_product(hull[-2], hull[-1], points[i])
