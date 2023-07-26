@@ -6,6 +6,8 @@ import vtk
 from tqdm import tqdm
 import trimesh
 from vtk.util.numpy_support import numpy_to_vtk
+import nibabel as nib
+import pandas as pd
 
 
 import registration
@@ -325,8 +327,8 @@ def position_threshold_mesh(input, output, min=[-0.4, -0.4, -0.4], max=[0.4, 0.4
     writer.Write()
 
 #thresholds a mesh based on color
-    #tailered to green
-def color_threshold_mesh(input, output, abs_threshold=[200,200,200], ratio_threshold=0.75, g_abs_thresh=90):
+    #tailored to green for NERF
+def color_threshold_mesh(input, output, abs_threshold=[200,200,200], ratio_threshold=0.75, g_abs_thresh=90, H1=False):
 
     def pass_abs_threshold(color, R, G, B):
         return color[0] < R and color[1] > G and color[2] < B
@@ -335,7 +337,16 @@ def color_threshold_mesh(input, output, abs_threshold=[200,200,200], ratio_thres
         red, green, blue = color[0], color[1], color[2]
         if green == 0:
             return False
-        return red/green < ratio_threshold and blue/green < ratio_threshold and green > g_abs_thresh
+        return (red/green < ratio_threshold and blue/green < ratio_threshold and green > g_abs_thresh) #or red/green < 0.85 and blue/green < 0.85
+
+    def H1_pass_abs_threshold(color, R, G, B):
+        return color[0] < R and color[1] > G and color[2] > B
+    
+    def H1_pass_ratio_threshold(color):
+        red, green, blue = color[0], color[1], color[2]
+        if blue == 0 or green == 0:
+            return False
+        return red/green < ratio_threshold and red/blue < ratio_threshold and green > g_abs_thresh
 
     # Read the VTK file
     reader = vtk.vtkPolyDataReader()
@@ -347,7 +358,10 @@ def color_threshold_mesh(input, output, abs_threshold=[200,200,200], ratio_thres
 
     # Get the point data and RGB color array
     point_data = polydata.GetPointData()
-    color_array = point_data.GetArray("Colors")
+    if not H1:
+        color_array = point_data.GetArray("Colors")
+    else:
+        color_array = point_data.GetScalars()
 
     # Create a mask for the vertices to remove
     mask = np.ones(polydata.GetNumberOfPoints(), dtype=bool)
@@ -357,11 +371,22 @@ def color_threshold_mesh(input, output, abs_threshold=[200,200,200], ratio_thres
     G = abs_threshold[1]
     B = abs_threshold[2]
     print("Creating mask based on color threshold of [{},{},{}]...".format(R, G, B))
-    for i in range(polydata.GetNumberOfPoints()):
-        color = color_array.GetTuple(i)
+    #NERF
+    if not H1:
+        for i in range(polydata.GetNumberOfPoints()):
+            color = color_array.GetTuple(i)
 
-        if pass_abs_threshold(color, R, G, B) or pass_ratio_threshold(color):
-            mask[i] = False  # Mark the vertex for removal
+            if pass_abs_threshold(color, R, G, B) or pass_ratio_threshold(color):
+                mask[i] = False  # Mark the vertex for removal
+    #H1 camera segmentation: blue background
+    else:
+        #over 190 BG, R < 110
+        #also 60% ratio threshold
+        for i in range(polydata.GetNumberOfPoints()):
+            color = color_array.GetTuple(i)
+
+            if H1_pass_abs_threshold(color, R, G, B) or H1_pass_ratio_threshold(color):
+                mask[i] = False  # Mark the vertex for removal
 
     print("Done creating mask. Now using mask to filter out vertices...")
     # Create a new polydata to hold the filtered data
@@ -425,6 +450,97 @@ def color_threshold_mesh(input, output, abs_threshold=[200,200,200], ratio_thres
     writer.SetInputData(filtered_polydata)
     writer.Write()
 
+
+def remove_paraview_selected_points(input, csv, outfile, H1=False):
+
+    def get_points_list(csv):
+        df = pd.read_csv(csv)
+        return df['Point ID'].tolist()
+
+    # Read the VTK file
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(str(input))
+    reader.Update()
+
+    # Get the polydata from the reader
+    polydata = reader.GetOutput()
+
+    # Get the point data and RGB color array
+    point_data = polydata.GetPointData()
+    if not H1:
+        color_array = point_data.GetArray("Colors")
+    else:
+        color_array = point_data.GetScalars()
+
+    # Create a mask for the vertices to remove
+    mask = np.ones(polydata.GetNumberOfPoints(), dtype=bool)
+
+    #get the list of point IDs to remove
+    delete_points = get_points_list(csv)
+
+    # Iterate over the points and colors
+    print("Removing selected points...")
+
+    for i in range(polydata.GetNumberOfPoints()):
+
+        if i in delete_points:
+            mask[i] = False  # Mark the vertex for removal
+
+    print("Done creating mask. Now using mask to filter out vertices...")
+    # Create a new polydata to hold the filtered data
+    filtered_polydata = vtk.vtkPolyData()
+
+    # Copy the remaining points to the filtered polydata
+    points = vtk.vtkPoints()
+    filtered_colors = vtk.vtkUnsignedCharArray()
+    filtered_colors.SetNumberOfComponents(3)
+    filtered_colors.SetName("Colors")
+
+    # Create a map from old vertex IDs to new vertex IDs
+    vertex_map = {}
+
+    print("Total points:", polydata.GetNumberOfPoints())
+    print("Number of points to keep:", np.count_nonzero(mask))
+
+    for i in range(polydata.GetNumberOfPoints()):
+        if mask[i]:
+            new_vertex_id = points.InsertNextPoint(polydata.GetPoint(i))
+            vertex_map[i] = new_vertex_id
+            color_tuple = color_array.GetTuple(i)
+
+            filtered_colors.InsertNextTuple3(color_tuple[0], color_tuple[1], color_tuple[2])
+
+    filtered_polydata.SetPoints(points)
+    filtered_polydata.GetPointData().SetScalars(filtered_colors)
+
+    print("Now removing faces associated with removed vertices...")
+
+    # Remove the faces associated with the removed vertices
+    filtered_faces = vtk.vtkCellArray()
+    faces = polydata.GetPolys()
+    faces.InitTraversal()
+
+    while True:
+        face = vtk.vtkIdList()
+        if faces.GetNextCell(face) == 0:
+            break
+        # Check if all face vertices are in the vertex map
+        if all(vertex_map.get(face.GetId(j)) is not None for j in range(3)):
+            filtered_face = vtk.vtkIdList()
+            for j in range(3):
+                vertex_id = vertex_map[face.GetId(j)]
+                filtered_face.InsertNextId(vertex_id)
+            filtered_faces.InsertNextCell(filtered_face)
+
+    print("Done filtering faces. Now exporting vtk file...")
+
+    filtered_polydata.SetPolys(filtered_faces)
+
+    # Write the filtered polydata to a new VTK file
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetFileName(str(outfile))
+    writer.SetInputData(filtered_polydata)
+    writer.Write()
 
 def get_largest_connected_component(input, output):
 
@@ -525,7 +641,7 @@ def convert_ply_to_vtk(input, output):
     writer.Write()
 
 
-def calc_fiducial_distances_hip_H1(rootdir):
+def calc_fiducial_distances_hip_H1(rootdir, obj_name="hip", static_name="CT_centered_fiducials.vtk"):
 
     def sort_by_proximity(v1, v2):
         #match the fiducials
@@ -544,18 +660,26 @@ def calc_fiducial_distances_hip_H1(rootdir):
             dists.append(mindist)
         return np.stack(v2_match_list), dists
 
-    static = rootdir/("CT_centered_fiducials.vtk")
+    static = rootdir/("{}".format(static_name))
     _, static_fiducials, _, _ = registration.get_points_vtk(static)
 
     all_dists = []
 
-    for i in range(1, 6, 1):
-        surf_fiducials_file = rootdir/("hip{}".format(i))/("registered_fiducials.vtk")
+    for i in range(1, 9, 1):
+        if obj_name == "hip":
+            surf_fiducials_file = rootdir/("{}{}".format(obj_name, i))/("registered_fiducials.vtk")
+            if not surf_fiducials_file.exists():
+                surf_fiducials_file = rootdir/("{}{}_fiducials_scaled_registered.vtk".format(obj_name, i))
+        else:
+            surf_fiducials_file = rootdir/("{}{}_centered_fiducials_registered.vtk".format(obj_name, i))
+            #print(surf_fiducials_file)
+        if not surf_fiducials_file.exists():
+            continue
         _, surf_fiducials, _, _ = registration.get_points_vtk(surf_fiducials_file)
         #print(surf_fiducials)
         matched_fiducials, dists = sort_by_proximity(np.stack(static_fiducials), np.stack(surf_fiducials))
 
-        all_dists.append(dists)
+        all_dists.append((i, dists))
     return all_dists
 
 def get_component_with_point(input, output, coords=None, point_id=None):
@@ -635,6 +759,29 @@ def appx_max_distance_mesh(points):
     return (point1, point2), np.sqrt(longest2)
 
 
+def brute_force_get_max_dist(input, step):
+
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(str(input))
+    reader.Update()
+
+    polydata = reader.GetOutput()
+    points = polydata.GetPoints()
+    num_pts = points.GetNumberOfPoints()
+
+    maxdist = 0
+    pair = None
+    for i in tqdm(range(0, num_pts, step)):
+        point1 = points.GetPoint(i)
+        for j in range(i+1, num_pts, step):
+            point2 = points.GetPoint(j)
+            dist =  vtk.vtkMath.Distance2BetweenPoints(point1, point2)
+            if dist > maxdist:
+                pair = (point1, point2)
+                maxdist = dist
+    return pair, maxdist
+
+
 #read in vtk file and return the polydata
 def get_polydata_vtk(input):
     # Read the VTK file
@@ -642,6 +789,139 @@ def get_polydata_vtk(input):
     reader.SetFileName(str(input))
     reader.Update()
     return reader.GetOutput()
+
+#read in a csv to get the point IDs of fiducials, and then gets the corresponding points on the ICP surface
+    #outputs these fiducials as a pointcloud
+def get_ICP_moved_fiducials(csv, vtkin, vtkout):
+    #given point IDs in a csv file, creates a vtk file of the corresponding points from an ICP registered surface
+    def get_pointIDs(csv):
+        df = pd.read_csv(csv)
+        ids = []
+        for row in df.iterrows():
+            id = row[1]['Point ID']
+            ids.append(id)
+        return ids
+    
+    ids = get_pointIDs(csv)
+    #now, read in the vtk points for the ICP registered vtk
+    polydata = get_polydata_vtk(vtkin)
+    points = polydata.GetPoints()
+    fiducials = []
+    for id in ids:
+        point = points.GetPoint(int(id))
+        fiducials.append(np.array(point))
+    #print(fiducials)
+    registration.create_vtk_pointcloud(fiducials, vtkout)
+
+###
+# Related to fiducials
+###
+
+#given the CT with the markers and the segmentation from Peter's code, places the markers onto the segmentation
+#CT has markers that do not get IDed in the segmentation from Peter's code
+    #this will add them to the segmentation
+def place_markers_on_seg(CT, SEG, OUT):
+    ct_f = nib.load(CT)
+    ct = ct_f.get_fdata()
+
+    seg_f = nib.load(SEG)
+    seg = seg_f.get_fdata()
+
+    #get the locations where the markers are
+    markers_loc = np.where(ct > 3000)
+
+    #create a new segmentation
+    new_seg = seg.copy()
+    new_seg[markers_loc] = 1
+
+    #now output the new nifti segmentation
+    new_seg_f = nib.Nifti1Image(new_seg, seg_f.affine, header=seg_f.header)
+
+    # Save the modified NIfTI data back to a new file
+    nib.save(new_seg_f, OUT)
+
+#move the mesh with markers on it into the centroid of the mesh without markers
+    #will allow us to identify fiducials on the mesh without markers
+def align_markered_to_centroid(vtk_seg, vtk_mark, vtk_seg_moved, vtk_mark_moved):
+    # Load the VTK file
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(str(vtk_seg))
+    reader.Update()
+
+    reader2 = vtk.vtkPolyDataReader()
+    reader2.SetFileName(str(vtk_mark))
+    reader2.Update()
+
+    # Get the output polydata
+    polydata = reader.GetOutput()
+    polydata2 = reader2.GetOutput()
+
+    # Get the points (vertices) from the polydata
+    points = polydata.GetPoints()
+    points2 = polydata2.GetPoints()
+
+    # Compute the centroid
+    centroid = [0.0, 0.0, 0.0]
+    num_points = points.GetNumberOfPoints()
+    for i in range(num_points):
+        point = points.GetPoint(i)
+        centroid = [c + p for c, p in zip(centroid, point)]
+    centroid = [c / num_points for c in centroid]
+
+    # Subtract the centroid from each point
+    for i in range(num_points):
+        point = points.GetPoint(i)
+        aligned_point = [p - c for p, c in zip(point, centroid)]
+        points.SetPoint(i, aligned_point)
+
+    #and from the second mesh
+    num_points2 = points2.GetNumberOfPoints()
+    for i in range(num_points2):
+        point = points2.GetPoint(i)
+        aligned_point = [p - c for p, c in zip(point, centroid)]
+        points2.SetPoint(i, aligned_point)
+
+    # Save the aligned points to a VTK file
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetFileName(str(vtk_seg_moved))
+    writer.SetInputData(polydata)
+    writer.Write()
+
+    writer2 = vtk.vtkPolyDataWriter()
+    writer2.SetFileName(str(vtk_mark_moved))
+    writer2.SetInputData(polydata2)
+    writer2.Write()
+
+
+#these two convert the paraview output csv points into a vtk file of points
+def create_vtk_file_from_points(points, output):
+    #given a set of 3 fiducials, creates a VTK file of the 3 points
+    #print([x for x in [coord for coord in points]])
+
+    points = [np.array(point) for point in points]
+    points = np.stack(points).flatten()
+    print(points)
+
+    with open(output, "w") as vtk_file:
+        vtk_file.write("# vtk DataFile Version 5.1\n")
+        vtk_file.write("vtk output\n")
+        vtk_file.write("ASCII\n")
+        vtk_file.write("DATASET POLYDATA\n")
+        vtk_file.write("POINTS 3 float\n")
+        vtk_file.write(" ".join(str(coord) for coord in points.tolist()) + "\n")
+        vtk_file.write("VERTICES 4 3\n")
+        vtk_file.write("OFFSETS vtktypeint64\n")
+        vtk_file.write("0 1 2 3\n")
+        vtk_file.write("CONNECTIVITY vtktypeint64\n")
+        vtk_file.write("0 1 2\n")
+
+def create_vtk_file_from_csv(csv, output):
+    points = registration.get_fiducials_from_csv(csv)
+    create_vtk_file_from_points(points, output)
+##
+
+
+# def calculate_mesh_weighted_surface_distance()
 
 #functions for calculating the maximum distance between two points on a mesh
     #uses the convex hull method and Graham Scan

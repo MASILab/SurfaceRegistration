@@ -47,7 +47,7 @@ def load_vtk_as_trimesh(vtk_file):
 def compute_closest_points_on_surface(point_mesh, surf_mesh):
     #given two vtk files, computes the closest points on the surface of one mesh to each point on the other mesh
         #point_mesh: file that cointains the points we wish to query
-        #surf_mesh: file that contains the surface in question
+        #surf_mesh: file that contains the surface in question (i.e. the CT scan)
 
     #read in the points we wish to query
     points = load_vtk_as_trimesh(point_mesh).vertices
@@ -58,11 +58,28 @@ def compute_closest_points_on_surface(point_mesh, surf_mesh):
     #print(mesh.vertices.shape)
     
     #now, compute the closest points on "mesh" to each point in "points"
+        #split the list into two groups
     (closest_points, distances, triangle_id) = mesh.nearest.on_surface(points)
+
+    # np_points = []
+    # for point in points:
+    #     np_points.append(np.array(point.data))
+    # np_points = np.stack(np_points)
+    # lst1 = np_points[:np_points.shape[0]//2, :]
+    # lst2 = np_points[np_points.shape[0]//2:, :]
+    # lst3 = lst2[:lst2.shape[0],:]
+    # lst4 = lst2[lst2.shape[0]:,:]
+
+    # (closest_points1, distances1, triangle_id1) = mesh.nearest.on_surface(lst1)
+    # print("list1")
+    # (closest_points2, distances2, triangle_id2) = mesh.nearest.on_surface(lst3) #steak1 seems to always break on this and I dont know why
+    # print("lst2")
+    # (closest_points4, distances4, triangle_id4) = mesh.nearest.on_surface(lst4)
+    # print("lst3")
 
     return (closest_points, distances, triangle_id)
 
-def calc_mse_points_to_mesh(point_mesh, surf_mesh):
+def calc_mse_points_to_mesh(point_mesh, surf_mesh, density_weighted=False):
     #given two VTK files, compute the MSE distances from the points of one mesh to the surface of another
         #point_mesh: file that cointains the points we wish to query
         #surf_mesh: file that contains the surface in question
@@ -70,8 +87,8 @@ def calc_mse_points_to_mesh(point_mesh, surf_mesh):
     #get the distances
     (closest_points, distances, triangle_id) = compute_closest_points_on_surface(point_mesh, surf_mesh)
 
-    #now square them
-    return np.array(distances)**2
+    #now square them and divide to get the average MSE distance of the surfaces
+    return np.array(distances)**2 / len(distances)
 
 def calc_fiducial_mse(v1, v2):
     #given two sets of vertices, calculate the MSE distance between them
@@ -343,37 +360,57 @@ def get_fiducials_from_csv(path):
     return np.stack(points)
 
 #applies the transforms to the fiducials
-def apply_transforms_to_fiducials(PCA_r, ICP_r, ICP_t, points, debug=False):
+def apply_transforms_to_fiducials(PCA_r, ICP_r, ICP_t, points, debug=False, scale=None, inverse=False):
     #points is an Nx3 numpy array
 
     #rot1
-    if debug:
-        print("Original Centered")
-        print(points)
-    #x = np.dot(points, PCA_r)
-    x = np.dot(points, PCA_r.T)
-    if debug:
-        print("PCA aligned")
-        print(x)
-    x = np.dot(x, ICP_r)
-    if debug:
-        print("ICP rotation")
-        print(x)
-    x = x + ICP_t
-    if debug:
-        print("ICP translation")
-        print(x)
+    if not inverse:
+        if debug:
+            print("Original Centered")
+            print(points)
+        #x = np.dot(points, PCA_r)
+        #x = points
+        x = np.dot(points, PCA_r.T)
+        if debug:
+            print("PCA aligned")
+            print(x)
+        x = np.dot(x, ICP_r)
+        if debug:
+            print("ICP rotation")
+            print(x)
+        x = x + ICP_t
+        #x = x - ICP_t
+        if debug:
+            print("ICP translation")
+            print(x)
+        if scale != None:
+            x = x*scale
+            #x = x*(1/scale)
+            if debug:
+                print("Scaling")
+                print(x)
+        return x
+    else: #for the inverse ICP: need to add the translation and then apply roation and scaling
+        x = points
+        x = x + ICP_t
+        x = np.dot(x, ICP_r)
+        x = x*scale
+        return x
 
-    return x
 
 #get the transforms
-def get_transforms(rootpath):
+def get_transforms(rootpath, scale=False):
 
     #gets the transforms for PCA and ICP
     outputs = rootpath/("outputs")
+    print(outputs)
     pca_r = np.loadtxt(outputs/("PCA_rotation.npy"))
     icp_r = np.loadtxt(outputs/("ICP_rotation.npy"))
     icp_t = np.loadtxt(outputs/("ICP_translation.npy"))
+
+    if scale:
+        icp_scale = np.loadtxt(outputs/("ICP_scale.npy"))
+        return (pca_r, icp_r, icp_t, icp_scale)
 
     return (pca_r, icp_r, icp_t)
 
@@ -382,15 +419,19 @@ def get_transforms(rootpath):
 #scale up the surface to the proper dimensions
 def scale_up_mesh(static, moving, output):
 
-    def get_furthest_distance(points):
+    def get_furthest_distance(points, step):
         longest = 0
         pair = ()
         numpoints = points.GetNumberOfPoints()
-        for i in tqdm(range(numpoints)):
+        #np_points = vtk.util.numpy_support.vtk_to_numpy(points)
+        for i in tqdm(range(0, numpoints, step)):
             point1 = points.GetPoint(i)
-            for j in range(i+1, numpoints):
+            #point1 = np_points[i, :3]
+            for j in range(i+1, numpoints, step):
                 point2 = points.GetPoint(j)
-                dist = vtk.vtkMath.Distance2BetweenPoints(point1, point2)
+                #point2 = np_points[j, :3]
+                dist = np.sqrt(vtk.vtkMath.Distance2BetweenPoints(point1, point2))
+                #dist = np.linalg.norm(point1 - point2)
 
                 if dist > longest:
                     longest = dist
@@ -408,13 +449,15 @@ def scale_up_mesh(static, moving, output):
 
     #get the furthest distance between any two points for the static data
     print("Calculating the furthest distance between any two points on the static mesh...")
-    static_pair, static_dist = utils.appx_max_distance_mesh(static_reader.GetOutput().GetPoints()) #get_furthest_distance(static_reader.GetOutput().GetPoints())
+    #static_pair, static_dist = utils.appx_max_distance_mesh(static_reader.GetOutput().GetPoints()) #get_furthest_distance(static_reader.GetOutput().GetPoints())
+    static_pair, static_dist = get_furthest_distance(static_reader.GetOutput().GetPoints(), 5)
 
     #do the same for the moving mesh
     moving_poly = moving_reader.GetOutput()
     moving_points = moving_poly.GetPoints()
     print("Calculating the furthest distance between any two points on the moving mesh...")
-    moving_pair, moving_dist = utils.appx_max_distance_mesh(moving_points)
+    #moving_pair, moving_dist = utils.appx_max_distance_mesh(moving_points)
+    moving_pair, moving_dist = get_furthest_distance(moving_points, 5)
 
     #now, find the scaling factor and use it to scale up the points
     scale = static_dist / moving_dist
@@ -440,6 +483,54 @@ def scale_up_mesh(static, moving, output):
     writer.Write()
 
     return scale
+
+#given either an (x,y,z) scaling or rotation, performs the transformation on a vtk mesh
+def transform_vtk(input, output, transformation, scale=True):
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(input)
+    reader.Update()
+
+    transform = vtk.vtkTransform()
+    if scale:
+        transform.Scale(transformation[0], transformation[1], transformation[2])  # Scaling factor of -1 along the Z-axis
+    else: #rotation
+        transform.RotateX(transformation[0])
+        transform.RotateY(transformation[1])
+        transform.RotateZ(transformation[2])
+
+    # Apply the transformation to the polydata
+    transform_filter = vtk.vtkTransformPolyDataFilter()
+    transform_filter.SetInputData(reader.GetOutput())
+    transform_filter.SetTransform(transform)
+    transform_filter.Update()
+
+    # Get the transformed polydata
+    vtk_writer = vtk.vtkPolyDataWriter()
+    vtk_writer.SetFileName(output)
+    vtk_writer.SetInputData(transform_filter.GetOutput())
+    vtk_writer.Write()
+
+#given a mesh, input vector, and degrees of rotation, rotates the mesh along that vector by that given degrees of rotation
+def rotate_along_vector(input, output, degrees, axis):
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(input)
+    reader.Update()
+
+    transform = vtk.vtkTransform()
+    rotation_axis = np.array(axis)
+    rotation_axis = rotation_axis / np.linalg.norm(rotation_axis)
+
+    transform.RotateWXYZ(degrees, rotation_axis[0], rotation_axis[1], rotation_axis[2])
+
+    transform_filter = vtk.vtkTransformPolyDataFilter()
+    transform_filter.SetInputData(reader.GetOutput())
+    transform_filter.SetTransform(transform)
+    transform_filter.Update()
+
+    vtk_writer = vtk.vtkPolyDataWriter()
+    vtk_writer.SetFileName(output)
+    vtk_writer.SetInputData(transform_filter.GetOutput())
+    vtk_writer.Write()
 
 def create_vtk_pointcloud(array, output):
     #given a numpy array of size Nx3, outputs a pointcloud
@@ -510,7 +601,7 @@ def reverse_icp_registration(CT, nerf, output, R=None, t=None, s=None):
 ## Main function ##########
 ###########################
 
-def register_vtk_to_nifti(nifti, src, png, output_dir, threshold_value=200, inversions=[False, False, False]):
+def register_vtk_to_nifti(nifti, src, png, output_dir, threshold_value=200, inversions=[False, False, False], H1=False, PCA_only=False, input_PCA=None):
 
     #first, convert the obj file to vtk
 
@@ -570,10 +661,13 @@ def register_vtk_to_nifti(nifti, src, png, output_dir, threshold_value=200, inve
     apply_rotation_vtk(moving_vtk_centered, rot, pca_aligned)
     print("***DONE APPLYING PCA ALIGNMENT***")
 
+    if PCA_only:
+        return
+
     #now that they are principally aligned, use ICP to do a better alignment
     print("***COMPUTING ICP ALIGNMENT***")
     ICP_aligned_vtk = output_dir/("moving_ICP_aligned.vtk")
-    if str(src).endswith('.obj'):
+    if str(src).endswith('.obj') or H1:
         ICP_sol, mpolydata = icp_registration(static_vtk_centered, pca_aligned)
         #get the registered points and transforms
         moved_points = ICP_sol.Xt.squeeze(0).numpy()
@@ -593,7 +687,11 @@ def register_vtk_to_nifti(nifti, src, png, output_dir, threshold_value=200, inve
         print("Data from NeRF, not H1 Camera. Using scale for ICP registration...")
         print("Scaling the NeRF surface to be approximately the same size as the CT surface...")
         moving_scaled = output_dir/("moving_scaled.vtk")
-        prelim_scale = scale_up_mesh(static_vtk_centered, pca_aligned, moving_scaled)
+        if input_PCA != None:
+            print("Using {} to scale up mesh instead of PCA output".format(str(input_PCA)))
+            prelim_scale = scale_up_mesh(static_vtk_centered, input_PCA, moving_scaled)
+        else:
+            prelim_scale = scale_up_mesh(static_vtk_centered, pca_aligned, moving_scaled)
         print("Done with preliminary scaling. Saving the preliminary scale factor...")
         prelim_scale_f = output_dir/("prelim_scale.npy")
         np.savetxt(prelim_scale_f, np.array([prelim_scale]))
