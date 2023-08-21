@@ -63,6 +63,15 @@ def create_vtk_from_obj(obj, texture_file, output):
     #     vertex_normals.InsertNextTuple3(*normal)
     # poly_data.GetPointData().SetNormals(vertex_normals)
 
+    #Add the normals to the VTK data as well
+    vertex_normals.SetName("Normals")
+    vertex_normals.SetNumberOfComponents(3)
+
+    for normal in normals:
+        vertex_normals.InsertNextTuple3(normal[0], normal[1], normal[2])
+
+    poly_data.GetPointData().SetNormals(vertex_normals)
+
     # Set faces
     for face in faces:
         triangle = vtk.vtkTriangle()
