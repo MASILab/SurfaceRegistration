@@ -601,9 +601,10 @@ def convert_ply_to_vtk(input, output):
     # Load the PLY file using trimesh
     mesh = trimesh.load_mesh(str(input))
 
-    # Extract the vertices and faces from the mesh
+    # Extract the vertices and faces (and normals) from the mesh
     vertices = mesh.vertices
     faces = mesh.faces.reshape(-1, 3)
+    normals = mesh.vertex_normals
 
     # Create a VTK PolyData object
     polydata = vtk.vtkPolyData()
@@ -621,6 +622,16 @@ def convert_ply_to_vtk(input, output):
         vtk_faces.InsertNextCell(3, [int(face[0]), int(face[1]), int(face[2])])
 
     polydata.SetPolys(vtk_faces)
+
+    #Add the normals to the VTK data as well
+    vtk_normals = vtk.vtkFloatArray()
+    vtk_normals.SetName("Normals")
+    vtk_normals.SetNumberOfComponents(3)
+
+    for normal in normals:
+        vtk_normals.InsertNextTuple3(normal[0], normal[1], normal[2])
+
+    polydata.GetPointData().SetNormals(vtk_normals)
 
     # Add color to the vertices
     colors = mesh.visual.vertex_colors  # Assuming color data exists in the PLY file
@@ -919,6 +930,43 @@ def create_vtk_file_from_csv(csv, output):
     points = registration.get_fiducials_from_csv(csv)
     create_vtk_file_from_points(points, output)
 ##
+
+#given a registered surface and a refgerence surface (VTK files), outputs a new VTK file with the surface distance array added to each point
+def create_vtk_with_surf_distances(testin, testref, testout):
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(testin)
+    reader.Update()
+
+    polydata = reader.GetOutput()
+
+    points=polydata.GetPoints()
+    num_pts = points.GetNumberOfPoints()
+
+    #new data array for surface distance
+    dist_array = vtk.vtkDoubleArray()
+    #dist_array.SetNumberOfComponents(3)
+    dist_array.SetNumberOfComponents(1)
+    dist_array.SetName("SurfDist")
+
+    #get the distances
+    (_, distances, _) = registration.compute_closest_points_on_surface(testin, testref)
+
+    #loop through all the points and color by the distance from the static surface
+        #TEST: color by coordinate
+    for i in range(num_pts):
+        point = points.GetPoint(i)
+        data = distances[i]
+        #dist_array.InsertNextTuple3(data[0], data[1], data[2])
+        dist_array.InsertNextValue(data)
+
+    #now assign the array to the polydata
+    polydata.GetPointData().AddArray(dist_array)
+
+    #now save to a new vtk file
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetFileName(testout)
+    writer.SetInputData(polydata)
+    writer.Write()
 
 
 # def calculate_mesh_weighted_surface_distance()
