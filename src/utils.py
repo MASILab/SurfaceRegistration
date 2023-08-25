@@ -8,7 +8,7 @@ import trimesh
 from vtk.util.numpy_support import numpy_to_vtk
 import nibabel as nib
 import pandas as pd
-
+from scipy.spatial import ConvexHull
 
 import registration
 
@@ -941,6 +941,7 @@ def create_vtk_file_from_csv(csv, output):
 ##
 
 #given a registered surface and a refgerence surface (VTK files), outputs a new VTK file with the surface distance array added to each point
+    #mostly for visualization purposes
 def create_vtk_with_surf_distances(testin, testref, testout):
     reader = vtk.vtkPolyDataReader()
     reader.SetFileName(testin)
@@ -976,6 +977,179 @@ def create_vtk_with_surf_distances(testin, testref, testout):
     writer.SetFileName(testout)
     writer.SetInputData(polydata)
     writer.Write()
+
+
+
+#given a polydata object and a np array of points (that is the same length), replaces the points in polydata with the new array of points
+def replace_points(polydata, points):
+    
+    vtk_new_points = vtk.vtkPoints()
+    vtk_new_points.SetData(vtk.util.numpy_support.numpy_to_vtk(points))
+
+    polydata.SetPoints(vtk_new_points)
+
+    return polydata
+
+
+#given a csv file of points exported from paraview and the vtk file from which they were selected, exports a vtk file
+#with the normals, colors, vertices, and cell connectivity for all of the selected points
+    #alternatively, just look at the pointIDs
+def segment_vtk_from_csv(csv, invtk, outvtk):
+    #read in csv
+    csv_pts = pd.read_csv(csv)
+
+    #parse the csv to get point data (coordinates, colors, normals)
+    cols_to_keep = 'Point ID,Colors_0,Colors_1,Colors_2,Normals_0,Normals_1,Normals_2,Points_0,Points_1,Points_2'.split(',')
+    pointIDs_to_keep = csv_pts['Point ID'].values
+
+    #from the selected points, keep the faces and vertices
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(invtk)
+    reader.Update()
+    polydata = reader.GetOutput()
+
+    #get the points and faces and colors and normals
+    points = polydata.GetPoints()
+    faces = polydata.GetPolys()
+    point_data = polydata.GetPointData()
+    colors = point_data.GetArray("Colors")
+    normals = point_data.GetArray("Normals")
+
+    #iterate through the faces. If all of the points are included in the pointIDs to keep, then add that face, the vertices,
+    # and the vertex information (colors/normals) to the new polydata
+    filtered_points = vtk.vtkPoints()
+    filtered_faces = vtk.vtkCellArray()
+
+    filtered_colors = vtk.vtkUnsignedCharArray()
+    filtered_colors.SetName("Colors")
+    filtered_colors.SetNumberOfComponents(3)
+
+    vtk_normals = vtk.vtkFloatArray()
+    vtk_normals.SetName("Normals")
+    vtk_normals.SetNumberOfComponents(3)
+
+    faces = polydata.GetPolys()
+    faces.InitTraversal()
+
+    old_to_new = {} #dictionaary from old indexes to new indexes
+    
+    #iterate over the points first
+    for i,id in enumerate(pointIDs_to_keep):
+        #get the information for that point
+        point = points.GetPoint(id)
+        color_tuple = colors.GetTuple(id)
+        normal_tuple = normals.GetTuple(id)
+
+        #add the mapping from new to old
+        old_to_new[id] = i
+
+        #add the point and information to the respective arrays
+        filtered_points.InsertNextPoint(point)
+        filtered_colors.InsertNextTuple3(color_tuple[0], color_tuple[1], color_tuple[2])
+        vtk_normals.InsertNextTuple3(normal_tuple[0], normal_tuple[1], normal_tuple[2])
+    
+    #now iterate over the faces
+    while True:
+        face = vtk.vtkIdList()
+        if faces.GetNextCell(face) == 0:
+            break
+        # Check if all face vertices are in the vertex map
+        #if all(vertex_map.get(face.GetId(j)) is not None for j in range(3)):
+        if all(old_to_new.get(face.GetId(j)) is not None for j in range(3)):
+            filtered_face = vtk.vtkIdList()
+            #all the points are included, so get all the point information and add it to the respective arrays
+            for j in range(3):
+                vertex_id = face.GetId(j)
+                filtered_face.InsertNextId(old_to_new[vertex_id])
+            filtered_faces.InsertNextCell(filtered_face)
+
+    #now set all the faces and vertices to a new polydata object
+    filtered_polydata = vtk.vtkPolyData()
+    filtered_polydata.SetPoints(filtered_points)
+    filtered_polydata.GetPointData().SetNormals(vtk_normals)
+    filtered_polydata.GetPointData().SetScalars(filtered_colors)
+    filtered_polydata.SetPolys(filtered_faces)
+
+    #now output the new vtk file
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetFileName(outvtk)
+    writer.SetInputData(filtered_polydata)
+    writer.Write()
+
+
+#given a vtk file, output the convex hull of the pointcloud
+def make_convex_hull(input_surf, output):
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(input_surf)
+    reader.Update()
+
+    polydata = reader.GetOutput()
+    point_list = polydata.GetPoints()
+    points = np.array([point_list.GetPoint(i) for i in range(point_list.GetNumberOfPoints())])
+
+    #calculate the convex hull
+    convex_hull = ConvexHull(points)
+    hull_pt_idxs = convex_hull.vertices
+    hull_points = points[hull_pt_idxs]
+    faces = convex_hull.simplices
+    #the indices of faces are for the original point indexes. Need to convert the old indices to the new ones
+    old_to_new = {}
+    for i,idx in enumerate(hull_pt_idxs):
+        old_to_new[idx] = i
+
+    hull_faces = []
+    for face in faces:
+        new_face = []
+        for pt in face:
+            new_face.append(old_to_new[pt])
+        hull_faces.append(np.array(new_face))
+    hull_faces = np.stack(hull_faces)
+
+    #create the vtk object
+        #points
+    vtkPoints = vtk.vtkPoints()
+    for point in hull_points:
+        vtkPoints.InsertNextPoint(point)
+
+        #faces
+    vtkCells = vtk.vtkCellArray()
+    for simplex in hull_faces:
+        vtkCells.InsertNextCell(len(simplex), simplex) #saying that we are inserting a triangle with the connectivity in "simplex"
+
+
+    polydata = vtk.vtkPolyData()
+    polydata.SetPoints(vtkPoints)
+    polydata.SetPolys(vtkCells)
+
+    #write it to a file
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetFileName(output)
+    writer.SetInputData(polydata)
+    writer.Write()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    #need to do the faces and the vertices separately
+
+
+        ####AHHHHHH figure it out tomorrow. Need to make sure that the point indices are being inserted correctly
+            #probably do the points first and then the faces
+            #for the points, create a mapping (like in the color segmentation) of old to new point IDs
+            #then, for each face in the oldd polydata, if all the points are ones to keep:
+                #use the mapping to insert a new face whose pointIDs are the new ones that we get from the mapping
 
 
 # def calculate_mesh_weighted_surface_distance()
